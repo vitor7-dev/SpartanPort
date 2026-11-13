@@ -1,0 +1,132 @@
+// A windowed program on Windows: no console opens with the launcher. From a terminal it attaches
+// to the terminal's console (`platform::attach_parent_console`).
+#![windows_subsystem = "windows"]
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use spartanport_launcher::core::i18n::{launcher_language, system_language};
+use spartanport_launcher::core::installation::Installation;
+use spartanport_launcher::core::paths::Paths;
+use spartanport_launcher::core::platform;
+use spartanport_launcher::core::release::ReleaseId;
+use spartanport_launcher::core::settings::load_app_settings;
+use spartanport_launcher::core::voice_swap;
+use spartanport_launcher::runner::{self, RunContext};
+use spartanport_launcher::startup::{self, Route};
+use spartanport_launcher::{ui, APP_NAME};
+
+fn main() {
+    // First, so `--version`, the update installer and start-up errors print in a terminal (and
+    // `--play`'s output: the Python's `attach_stdio`).
+    platform::attach_parent_console();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    // The environment and the folders derived once, for every route; a packaged port, or the
+    // checkout a cargo build sits in (`launcher-rust/target/...`).
+    let (route, context) = startup::start(&args, &exe_dir, std::env::vars_os(), cfg!(windows));
+    match route {
+        Route::Version => println!("{APP_NAME} {}", ReleaseId::this().plain()),
+        Route::Run { args } => {
+            let run = RunContext {
+                context: &context,
+                args,
+                out: &mut std::io::stdout(),
+            };
+            std::process::exit(runner::run(run))
+        }
+        Route::Prepare { args } => {
+            let run = RunContext {
+                context: &context,
+                args,
+                out: &mut std::io::stdout(),
+            };
+            std::process::exit(runner::prepare(run))
+        }
+        Route::Play => {
+            // As the Python `main`: the start-up steps and the settings first.
+            startup::apply_to_process(&context);
+            let paths = &context.paths;
+            startup::prepare(paths);
+            let mut settings = load_app_settings(paths);
+            if let Some(update) = startup::update_dir_arg(&args) {
+                settings.set(
+                    "update_dir",
+                    serde_json::Value::String(update.to_string_lossy().into_owned()),
+                );
+            }
+            // Without a usable game folder there is nothing to play yet: the window opens instead.
+            if Installation::read(
+                &settings.get_str("game_dir"),
+                &settings.get_str("update_dir"),
+            )
+            .verdict()
+            .passes()
+            {
+                let run = RunContext {
+                    context: &context,
+                    // The Python's `--play` starts the runner without arguments.
+                    args: Vec::new(),
+                    out: &mut std::io::stdout(),
+                };
+                std::process::exit(runner::play(run, &settings, paths));
+            }
+            open_window(context.paths);
+        }
+        Route::InstallUpdate { target, pid } => {
+            let lang = launcher_language(
+                &load_app_settings(&context.paths).get_str("ui_language"),
+                system_language,
+            );
+            std::process::exit(startup::install_update(&exe_dir, &target, pid, &lang))
+        }
+        Route::VoiceSwap { args } => {
+            // As the AppImage runs from a mount, `OWD` is the folder the player typed paths in.
+            let base = std::env::var_os("OWD");
+            let code = voice_swap::main(
+                &args,
+                base.as_deref().map(Path::new),
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            );
+            std::process::exit(code)
+        }
+        Route::Launcher => {
+            // Before the folders below are read from the environment.
+            startup::apply_to_process(&context);
+            startup::prepare(&context.paths);
+            open_window(context.paths);
+        }
+    }
+}
+
+/// The launcher window; exit code 1 when it cannot open.
+fn open_window(paths: Paths) {
+    let data_dir = paths.data_dir.clone();
+    let hook = std::panic::take_hook();
+    let panic_dir = data_dir.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        startup::log_failure(&panic_dir, &info.to_string());
+        hook(info);
+    }));
+    // Still a single thread: nothing has started the window's yet.
+    let chosen = ["ICED_BACKEND", "WGPU_BACKEND"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some());
+    if let Some((key, value)) = startup::prepare_window(&data_dir, chosen, cfg!(windows)) {
+        std::env::set_var(key, value);
+    }
+    if let Err(error) = ui::app::run(paths) {
+        eprintln!("{APP_NAME}: {error}");
+        startup::log_failure(&data_dir, &error.to_string());
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title(APP_NAME)
+            .set_description(error.to_string())
+            .show();
+        std::process::exit(1);
+    }
+}

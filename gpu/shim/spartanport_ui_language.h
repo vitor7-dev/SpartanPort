@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The in-game menu's languages: every table is keyed by the English text, and Tr() looks a text up in
+// the language in use. English needs no table. Chinese is used once its system font has been loaded
+// (spartanport_ui_font.h); the other languages are drawn with the embedded DejaVu Sans.
+#pragma once
+#include <atomic>
+#include <cstddef>
+#include <string_view>
+#include <utility>
+
+#include "ui_language/spartanport_ui_de.h"
+#include "ui_language/spartanport_ui_es.h"
+#include "ui_language/spartanport_ui_fr.h"
+#include "ui_language/spartanport_ui_id.h"
+#include "ui_language/spartanport_ui_it.h"
+#include "ui_language/spartanport_ui_cs.h"
+#include "ui_language/spartanport_ui_pl.h"
+#include "ui_language/spartanport_ui_pt.h"
+#include "ui_language/spartanport_ui_ru.h"
+#include "ui_language/spartanport_ui_tr.h"
+
+namespace SpartanUi {
+inline std::atomic<bool> chinese{false};      // Chinese is the language in use (its font is loaded).
+inline std::atomic<bool> chinese_font{false}; // The CJK font is loaded: Chinese can be chosen.
+inline bool WantsChinese(std::string_view language) {
+    return language == "zh" || language.starts_with("zh-") || language.starts_with("zh_");
+}
+inline constexpr std::pair<std::string_view, const char*> ChineseText[] = {
+    {"Windowed", "窗口化"},
+    {"Borderless", "无边框"},
+    {"Fullscreen", "全屏"},
+    {" FPS", " 帧"},
+    {"%d FPS (engine frame rate)", "%d 帧（引擎帧率）"},
+    {"%d change%s need%s a restart (unsaved progress is lost).", "%d 项更改需要重启（未保存进度会丢失）。%.0s%.0s"},
+    {"(nothing selected)", "（未选择任何项目）"},
+    {"0% is no background.", "0% 表示无背景。"},
+    {"1 (lowest latency)", "1（最低延迟）"},
+    {"1440 × 1080 · 4:3 (beta)", "1440 × 1080 · 4:3（测试）"},
+    {"1920 × 1200 · 16:10 (beta)", "1920 × 1200 · 16:10（测试）"},
+    {"1920 × 1440 · 4:3 (beta)", "1920 × 1440 · 4:3（测试）"},
+    {"2048 × 1536 · 4:3 (beta)", "2048 × 1536 · 4:3（测试）"},
+    {"2560 × 1080 · 21:9 (beta)", "2560 × 1080 · 21:9（测试）"},
+    {"2560 × 1600 · 16:10 (beta)", "2560 × 1600 · 16:10（测试）"},
+    {"2560 × 1920 · 4:3 (beta)", "2560 × 1920 · 4:3（测试）"},
+    {"3440 × 1440 · 21:9 (beta)", "3440 × 1440 · 21:9（测试）"},
+    {"3840 × 1600 · 21:9 (beta)", "3840 × 1600 · 21:9（测试）"},
+    {"5120 × 1440 · 32:9 (beta)", "5120 × 1440 · 32:9（测试）"},
+    {"5120 × 2160 · 21:9 (beta)", "5120 × 2160 · 21:9（测试）"},
+    {"60 FPS: the frame rate patch is not available for this game build", "60 帧：此游戏版本无法使用帧率补丁"},
+    {"A bar at the top for the last enemy hit.", "在顶部显示最近击中敌人的血条。"},
+    {"About", "关于"},
+    {"Absolute", "绝对位置"},
+    {"Anisotropic filtering", "各向异性过滤"},
+    {"Appearance", "外观"},
+    {"Applied on restart", "重启后生效"},
+    {"Apply and restart", "应用并重启"},
+    {"Automatic QTE", "自动完成 QTE"},
+    {"Background opacity", "背景不透明度"},
+    {"Big FPS gain. Switch it off if lighting or objects look wrong.", "大幅提高帧率；若光照或物体异常，请关闭。"},
+    {"Blue orbs (magic)", "蓝魂（魔法）"},
+    {"Bottom left", "左下角"},
+    {"Bottom right", "右下角"},
+    {"CPU (game)", "CPU（游戏）"},
+    {"Caps the frame rate. The engine frame rate (below) is the highest it can go.", "限制显示帧率，最高不超过下方设置的引擎帧率。"},
+    {"Cheats", "作弊选项"},
+    {"Close", "关闭"},
+    {"Compile new shaders in the background", "后台编译新着色器"},
+    {"Controller", "手柄"},
+    {"Controller: A = OK, B = cancel", "手柄：A 确认，B 取消"},
+    {"Controller: B = OK, A = cancel", "手柄：B 确认，A 取消"},
+    {"Controller: Cross (A) = OK, Circle (B) = cancel", "手柄：叉号（A）确认，圆圈（B）取消"},
+    {"Corner", "位置"},
+    {"Damage Kratos does to enemies.", "奎托斯对敌人造成的伤害。"},
+    {"Damage Kratos takes.", "奎托斯受到的伤害。"},
+    {"Damage dealt", "造成伤害"},
+    {"Damage taken", "受到伤害"},
+    {"Deferred GPU readbacks", "延迟 GPU 回读"},
+    {"Depth of field", "景深"},
+    {"Motion blur", "动态模糊"},
+    {"applied by the upscaler", "由升频器应用"},
+    {"The game's own motion blur on fast moving objects and the camera. Off removes it.", "游戏自带的动态模糊，作用于快速移动的物体和镜头。关闭后即可去除。"},
+    {"Display", "显示"},
+    {"Display mode", "显示模式"},
+    {"Effective limit", "实际帧率上限"},
+    {"Effects", "画面效果"},
+    {"Enable before opening New Game. Does not change an existing save difficulty.", "请在打开“新游戏”前启用，不改变已有存档难度。"},
+    {"Enemy health bar", "敌人血条"},
+    {"Engine frame rate", "引擎帧率"},
+    {"High Frame Rate Physics Fix", "高帧率物理修复"},
+    {"At high frame rates the engine runs at 60 while a quick-time prompt is on screen or during the Cronos blade pull, then goes back to the engine frame rate. The saved rate does not change.", "高帧率下，快速反应提示在屏幕上或在克洛诺斯身上用刀刃拉拽时，引擎以 60 运行，结束后回到引擎帧率。保存的帧率不会改变。"},
+    {"Engine frame rate: ", "引擎帧率："},
+    {"On", "开"},
+    {"Off", "关"},
+    {"Unavailable", "不可用"},
+    {"Engine frame rate: 60 FPS only (no frame rate patch for this game build)", "引擎帧率：仅支持 60 帧（此版本无可用帧率补丁）"},
+    {"Every multiplier back to 1x (the game's normal values).", "将所有倍率恢复为 1 倍（游戏正常数值）。"},
+    {"F12 saves a screenshot to the user\\screenshots folder.", "按 F12 将截图保存到 user\\screenshots 目录。"},
+    {"Fewer stutters in new areas; an object or effect may appear a moment later.", "减少新区域卡顿；物体或特效可能稍后出现。"},
+    {"Fewer waits for the GPU. Switch it off if textures or shadows look wrong.", "减少等待 GPU；若纹理或阴影异常，请关闭。"},
+    {"Font size", "字号"},
+    {"Frame rate limit", "帧率上限"},
+    {"Frames queued", "排队帧数"},
+    {"Frametime", "帧时间"},
+    {"GPU (name and use)", "GPU（名称和使用率）"},
+    {"Game", "游戏"},
+    {"Game default", "游戏默认"},
+    {"Game hooks", "游戏功能挂钩"},
+    {"Game image", "游戏画面"},
+    {"Game reads GPU data without waiting", "游戏读取 GPU 数据时不等待"},
+    {"Gold orbs (Rage of Sparta)", "金魂（斯巴达之怒）"},
+    {"Green orbs (health)", "绿魂（生命）"},
+    {"HUD", "游戏界面"},
+    {"Health from each green orb. The bar stays within its maximum.", "每个绿魂恢复的生命，最高不超过生命上限。"},
+    {"Health stays full. Only Kratos is protected. Turning it off does not undo past refills.", "生命保持满值，仅保护奎托斯。关闭后不会撤销已恢复的生命。"},
+    {"How strong the sharpening is.", "锐化效果的强度。"},
+    {"Image", "画面"},
+    {"Infinite Double Jumps", "无限空中跳跃"},
+    {"Infinite Rage of Sparta", "无限斯巴达之怒"},
+    {"Infinite health", "无限生命"},
+    {"Infinite item meter", "无限道具能量"},
+    {"Infinite magic", "无限魔法"},
+    {"Information", "信息"},
+    {"Items side by side or stacked.", "各项并排显示或分行显示。"},
+    {"Keep mouse in window", "将鼠标限制在窗口内"},
+    {"Keyboard: type, Backspace to erase, Enter = OK, Esc = cancel", "键盘：输入文字，Backspace 删除，Enter 确认，Esc 取消"},
+    {"L / R or Q / E: switch tabs. Settings are saved in spartanport.ini.", "L / R 或 Q / E：切换选项卡。设置保存在 spartanport.ini。"},
+    {"L1 / R1 or Q / E: switch tabs. Settings are saved in spartanport.ini.", "L1 / R1 或 Q / E：切换选项卡。设置保存在 spartanport.ini。"},
+    {"L2 aim with the mouse (Head of Helios, Bow of Apollo). Relative: the stick follows the movement and goes back to neutral when the mouse stops. Absolute: the stick points from where the mouse was when L2 was pressed to where it is.", "按 L2 用鼠标瞄准（赫利俄斯之首、阿波罗之弓）。相对模式跟随鼠标移动，停止时回中；绝对模式以按下 L2 时的位置为中心，根据偏移控制摇杆。"},
+    {"L2 aim with the mouse: lower needs more mouse movement for the same stick, higher less.", "L2 鼠标瞄准：数值越低，所需鼠标移动距离越大；越高则越小。"},
+    {"LB / RB or Q / E: switch tabs. Settings are saved in spartanport.ini.", "LB / RB 或 Q / E：切换选项卡。设置保存在 spartanport.ini。"},
+    {"Layout", "布局"},
+    {"Live", "即时生效"},
+    {"Loading shader cache %u%%", "正在加载着色器缓存 %u%%"},
+    {"Loading shader cache...", "正在加载着色器缓存……"},
+    {"Magic from each blue orb. The bar stays within its maximum.", "每个蓝魂恢复的魔法，最高不超过魔法上限。"},
+    {"Magic stays full.", "魔法保持满值。"},
+    {"Max red orbs", "最大红魂"},
+    {"More frames queued: steadier FPS, slower response to input.", "增加排队帧数可稳定帧率，但输入响应更慢。"},
+    {"Mouse prompt distance", "鼠标旋转提示距离"},
+    {"Multipliers", "倍率"},
+    {"Native · 1920 × 1080 · 16:9", "原生 · 1920 × 1080 · 16:9"},
+    {"No effect: the game's image is larger than the window.", "不生效：游戏画面大于窗口。"},
+    {"No effect: the game's image is smaller than the window.", "不生效：游戏画面小于窗口。"},
+    {"One item per line", "每项一行"},
+    {"One line", "单行"},
+    {"Overlay", "性能叠加层"},
+    {"Performance", "性能"},
+    {"Preparing graphics...", "正在准备图形……"},
+    {"Preview", "预览"},
+    {"QTE prompts", "QTE 提示"},
+    {"Quick-time prompts answer themselves: single presses, repeated presses, holds and stick rotations.", "自动完成快速反应提示：单次按键、连按、长按及摇杆旋转。"},
+    {"RAM (game / total)", "内存（游戏／总量）"},
+    {"Rage of Sparta from each gold orb. The bar stays within its maximum.", "每个金魂恢复的斯巴达之怒，最高不超过上限。"},
+    {"Rage of Sparta stays full.", "斯巴达之怒保持满值。"},
+    {"Red orbs", "红魂"},
+    {"Red orbs gained. Orbs you have and prices stay the same.", "获得的红魂数量倍率，不改变已有红魂和物品价格。"},
+    {"Red orbs stay at the maximum.", "红魂保持最大值。"},
+    {"Relative", "相对移动"},
+    {"Render resolution", "渲染分辨率"},
+    {"Repeat air jumps without landing. Turn off for normal movement.", "可连续空中跳跃，无需落地。关闭恢复正常移动。"},
+    {"Reset all to 1x", "全部恢复为 1 倍"},
+    {"Right stick sensitivity", "右摇杆灵敏度"},
+    {"Right stick style", "右摇杆模式"},
+    {"Shader cache", "着色器缓存"},
+    {"Anti-aliasing", "抗锯齿"},
+    {"Temporal anti-aliasing is running.", "时间性抗锯齿正在运行。"},
+    {"Temporal anti-aliasing is selected but not running (see last_run.log).", "已选择时间性抗锯齿，但未运行（见 last_run.log）。"},
+    {"Smooths jagged edges. FXAA is cheap and a little soft; SMAA keeps the picture sharper and costs a bit more. Both also touch the HUD slightly.", "平滑锯齿边缘。FXAA 开销小但画面略软；SMAA 画面更锐利，开销稍大。两者也会轻微影响 HUD。"},
+    {"Anti-aliasing is not active: this graphics card could not set it up.", "抗锯齿未生效：此显卡无法启用。"},
+    {"Sharpening", "锐化"},
+    {"Sharpening (RCAS)", "锐化 (RCAS)"},
+    {"Sharpening strength", "锐化强度"},
+    {"Sharpens the final image.", "对最终画面进行锐化。"},
+    {"Sharper floors and walls seen at an angle. Little cost on most GPUs.", "斜视地面和墙壁时更清晰，多数显卡的性能开销很小。"},
+    {"Show overlay", "显示性能叠加层"},
+    {"Size of the overlay text.", "性能叠加层文字大小。"},
+    {"Strength of the controller's vibration. 0% turns it off.", "手柄震动强度，0% 为关闭。"},
+    {"Textures (applied on restart)", "纹理（重启后生效）"},
+    {"The first start after an update takes longer.", "更新后的首次启动需要更长时间。"},
+    {"The game's own blur of distant objects, strongest in cutscenes. Off keeps the whole picture sharp.", "游戏自带的远景模糊，过场动画中最明显。关闭后整个画面保持清晰。"},
+    {"The highest frame rate the game itself runs at, from 30 to 240. 60 for spots that break above it (a ledge Kratos cannot cross, a button-mash prompt). Hold R3 and press R1 or L1, or hold F9 and press Right or Left: 5 FPS up or down.", "游戏引擎自身运行的最高帧率，范围 30 到 240。如果出现无法跨越边缘或连按提示异常，请改回 60。按住 R3 再按 R1 或 L1，或按住 F9 再按右或左方向键：每次增减 5 FPS。"},
+    {"The item meter (bow, Helios' head, boots) stays full.", "道具能量（弓、赫利俄斯之首、靴子）保持满值。"},
+    {"The performance overlay in a corner of the screen.", "在屏幕角落显示性能信息。"},
+    {"The resolution the game draws at. Higher is sharper and slower.", "游戏渲染画面的分辨率，越高越清晰，但性能开销越大。"},
+    {"Top left", "左上角"},
+    {"Top right", "右上角"},
+    {"Turn off Max red orbs to use the multiplier.", "先关闭“最大红魂”才能使用倍率。"},
+    {"Unavailable: game version or code signature mismatch.", "不可用：游戏版本或代码特征不匹配。"},
+    {"Unlimited", "无限制"},
+    {"Unlock Very Hard", "解锁极难模式"},
+    {"Up/Down or D-pad: choose   Enter or A: OK   Esc or B: cancel", "上下方向键或十字键选择；Enter 或 A 确认；Esc 或 B 取消"},
+    {"Up/Down or D-pad: choose   Enter or B: OK   Esc or A: cancel", "上下方向键或十字键选择；Enter 或 B 确认；Esc 或 A 取消"},
+    {"Up/Down or D-pad: choose   Enter or Cross (A): OK   Esc or Circle (B): cancel", "上下方向键或十字键选择；Enter 或叉号（A）确认；Esc 或圆圈（B）取消"},
+    {"Upscaler", "超分辨率"},
+    {"VRAM (used / available)", "显存（已用／可用）"},
+    {"VSync", "垂直同步"},
+    {"Vibration", "震动"},
+    {"Waits for the monitor: no tearing, a little more input delay.", "等待显示器同步：消除画面撕裂，但会略微增加输入延迟。"},
+    {"What to show", "显示项目"},
+    {"Where the overlay sits.", "性能叠加层的显示位置。"},
+    {"While you play, the mouse stays in the game window; this menu and other windows get it back.", "游玩时限制鼠标在游戏窗口内；打开本菜单或切换窗口时释放鼠标。"},
+    {"Window", "窗口"},
+    {"Windowed, borderless window or exclusive fullscreen.", "窗口化、无边框窗口或独占全屏。"},
+    {"With Joystick prompts on Adaptive mouse: how far the mouse moves for one step of a rotation.", "摇杆提示选择自适应鼠标时，每次旋转步进所需的鼠标移动距离。"},
+    {"applied", "已应用"},
+    {"damage", "伤害"},
+    {"enemy health", "敌人生命"},
+    {"loading %u%%", "加载中 %u%%"},
+    {"not applied", "未应用"},
+    {"orb pickups", "魂拾取"},
+    {"ready", "就绪"},
+    {"red orbs", "红魂"},
+    // the trophy window and the language option
+    {"Theme", "主题"},
+    {"Original", "原版"},
+    {"Card", "卡片"},
+    {"Card, cinematic platinum", "卡片（电影式白金）"},
+    {"Corner popup", "角落弹窗"},
+    {"How an unlocked trophy is shown. Original is the port's own notice.", "解锁奖杯时的显示方式。原版是移植版自带的通知。"},
+    {"Mute the sound", "静音"},
+    {"No sound plays without a sound file in user/custom_trophy.", "user/custom_trophy 中没有声音文件时不会播放声音。"},
+    {"Volume", "音量"},
+    {"Time on screen", "显示时间"},
+    {"Theme default", "主题默认"},
+    {"Platinum light", "白金光效"},
+    {"Animate the platinum", "白金动画"},
+    {"Off: the platinum shows its own picture, like the other trophies.", "关闭：白金奖杯和其他奖杯一样显示自己的图片。"},
+    {"Write the grade", "显示等级"},
+    {"The grade's name before the second line.", "在第二行前显示等级名称。"},
+    {"Bronze", "铜"},
+    {"Silver", "银"},
+    {"Gold", "金"},
+    {"Platinum", "白金"},
+    {"A preview: it looks and sounds like an unlock; nothing is unlocked or saved.", "预览：外观和声音与解锁相同；不会解锁或保存任何内容。"},
+    {"All four in a row", "四个连续"},
+    {"Three at once", "三个同时"},
+    {"Your files", "你的文件"},
+    {"Sounds:", "声音："},
+    {"Pictures:", "图片："},
+    {"Your own sounds, pictures, animations and texts go in user/custom_trophy (docs/TROPHIES.md). Sounds reload here; pictures when the game starts.", "你自己的声音、图片、动画和文字放在 user/custom_trophy（docs/TROPHIES.md）。声音在此重新加载；图片在游戏启动时加载。"},
+    {"Reload sounds", "重新加载声音"},
+    {"Trophy unlocked!", "奖杯已解锁！"},
+    {"Language", "语言"},
+    {"Pause the game", "暂停游戏"},
+    {"The game stops while this menu or the trophy list is open.", "打开此菜单或奖杯列表时游戏暂停。"},
+    {"Same as the launcher", "与启动器相同"},
+    {"The language of this menu and of the trophies. Until you choose one, the launcher's is used.", "此菜单和奖杯使用的语言。在你选择之前，使用启动器的语言。"},
+    {"built-in", "内置"},
+    {"drawn", "绘制"},
+    {"artwork", "奖杯图片"},
+    {"Badge", "徽章"},
+    {"Supported features", "支持的功能"},
+    {"What this game version can use. Each one is turned on or off in its own tab.", "此游戏版本可以使用的功能。每项功能在各自的选项卡中开启或关闭。"},
+    {"supported", "支持"},
+    {"not supported", "不支持"},
+    {"Orb pickups", "魂拾取"},
+    {"Damage", "伤害"},
+    {"All grades", "全部等级"},
+    {"Square/G: grade", "方块/G：等级"},
+    // TAA / FSR 3.1 look sliders (SpartanPort). Chinese.
+    {"TAA look (God of War III)", "TAA 画面效果（God of War III）"},
+    {"FSR 3.1 look (God of War III)", "FSR 3.1 画面效果（God of War III）"},
+    {"History on still picture", "静止画面的历史权重"},
+    {"History on moving picture", "运动画面的历史权重"},
+    {"Colour tolerance", "颜色容差"},
+    {"Moving objects", "运动物体"},
+    {"Texture detail", "纹理细节"},
+    {"Moving object edges", "运动物体边缘"},
+    {"Debug view (history)", "调试视图（历史）"},
+    {"TAA sharpening", "TAA 锐化"},
+    {"FSR 3.1 (native HUD)", "FSR 3.1（原生 HUD）"},
+    {"Higher: smoother edges on a still picture, a little more trail. Default 99%.", "数值越高：静止画面边缘越平滑，拖影略多。默认 99%。"},
+    {"Higher: smoother while the camera moves, more blur and trail. Default 55%.", "数值越高：镜头移动时更平滑，模糊和拖影更多。默认 55%。"},
+    {"Lower: less trail and ghosting, more flicker. Default 175%.", "数值越低：拖影和鬼影越少，闪烁越多。默认 175%。"},
+    {"How much history a moving character or object loses. Higher: less ghosting there, rougher edges. Default 55%.", "运动的角色或物体丢弃多少历史信息。数值越高：鬼影越少，边缘越粗糙。默认 55%。"},
+    {"XeSS (God of War III)", "XeSS（God of War III）"},
+    {"XeSS status", "XeSS 状态"},
+    {"Sharper textures (a negative mip bias, in percent of one level): XeSS turns the extra detail into a clean picture. Higher: more detail, more shimmer. Default 80%.", "更清晰的纹理（负 mip 偏移，以一级的百分比计）：XeSS 会把多出来的细节变成干净的画面。更高：细节更多，闪烁更多。默认 80%。"},
+    {"How much XeSS distrusts its history on characters and objects (a mask from the game's stencil). Higher: less ghosting behind them, rougher edges. 0% = off. Default 95%.", "XeSS 对角色和物体上的历史画面有多不信任（来自游戏模板缓冲的遮罩）。更高：它们身后的拖影更少，边缘更粗糙。0% = 关闭。默认 95%。"},
+    {"Sharpening after XeSS, separate from the Sharpening (RCAS) switch below. 0% = off. Default 145%.", "XeSS 之后的锐化，独立于下方的“锐化 (RCAS)”开关。0% = 关闭。默认 145%。"},
+    {"Sharper textures (a negative mip bias, in percent of one level): the accumulation turns the extra detail into a clean picture. Higher: more detail, more shimmer. Default 80%.", "更锐利的纹理（负 mip 偏置，以一级的百分比表示）：累积会把额外细节变成干净的画面。数值越高：细节越多，闪烁越多。默认 80%。"},
+    {"Smooths the stair-stepped edges of moving characters, where the history is refused: a spatial filter on those pixels only. Higher: smoother, slightly softer. Default 55%.", "平滑运动角色上因历史被拒绝而出现的锯齿边缘：仅对这些像素使用空间滤波。数值越高：越平滑，略偏软。默认 55%。"},
+    {"Shows where the history is used: red = rejected by depth, green = lost to colour change, blue = history weight used. For bug reports; not saved.", "显示历史的使用位置：红色 = 因深度被拒绝，绿色 = 因颜色变化而丢失，蓝色 = 使用的历史权重。用于错误报告；不会保存。"},
+    {"Sharpening after the accumulation, separate from the Sharpening (RCAS) switch below. 0% = off. Default 130%.", "累积之后的锐化，独立于下方的“锐化 (RCAS)”开关。0% = 关闭。默认 130%。"},
+    {"Sharper textures (a negative mip bias, in percent of one level) on top of FSR's own: the accumulation turns the extra detail into a clean picture. Higher: more detail, more shimmer. Default 0%.", "在 FSR 自带偏置之外的更锐利纹理（负 mip 偏置，以一级的百分比表示）：累积会把额外细节变成干净的画面。数值越高：细节越多，闪烁越多。默认 0%。"},
+    {"How much FSR distrusts its history on characters and objects. Higher: less ghosting behind them, rougher edges. Lower: smoother but more trails. Default 100%.", "FSR 对角色和物体历史信息的不信任程度。数值越高：其身后的鬼影越少，边缘越粗糙。数值越低：越平滑，但拖影更多。默认 100%。"},
+    {"FSR 3.1 (native HUD) keeps the game at 1920x1080 so the HUD, text and loading screens are not stretched, and has the port's own sharpening. FSR 4.1 needs an AMD Radeon with Adrenalin 26.10.1 or newer.", "FSR 3.1（原生 HUD）让游戏保持 1920x1080，因此 HUD、文字和加载画面不会被拉伸，并带有本移植版自带的锐化。FSR 4.1 需要 AMD Radeon 与 Adrenalin 26.10.1 或更新版本。"},
+    {"DualSense", "DualSense"},
+    {"Speaker", "扬声器"},
+    {"The sounds the game makes for the controller's speaker play on the DualSense's own speaker (USB only; a headset in the controller's jack gets them instead). Takes effect at the next start.", "游戏为手柄扬声器发出的声音改由 DualSense 自身的扬声器播放（仅限 USB；手柄耳机孔插入耳机时改由耳机播放）。下次启动时生效。"},
+    {"Speaker gain", "扬声器增益"},
+    {"The DualSense speaker's own level, which the Windows volume does not reach. The controller beeps at the new level when it changes.", "DualSense 扬声器自身的音量，Windows 音量无法调节。更改时手柄会以新音量发出提示音。"},
+    {"Trigger click", "扳机段落感"},
+    {"R2 gets a wall that gives way near the end of its travel.", "R2 在行程末端附近有一道会被按破的阻力。"},
+    {"Hit flash", "受伤闪光"},
+    {"The light bar flashes red when Kratos loses health.", "奎托斯失去生命值时，灯条闪烁红色。"},
+    {"QTE light bar", "QTE 灯条"},
+    {"While a QTE prompt is up, the light bar blinks in the colour of its button, with a short rumble at each new prompt.", "QTE 提示出现时，灯条以对应按键的颜色闪烁，每次出现新提示时短暂震动。"},
+    {"Motion sensors", "体感传感器"},
+    {"The controller's gyro and accelerometer are passed to the game.", "将手柄的陀螺仪和加速度计数据传给游戏。"},
+    {"Gyro aim", "陀螺仪瞄准"},
+    {"While L2 is held, turning and tilting the controller moves the view. Includes Motion sensors.", "按住 L2 时，转动和倾斜手柄可移动视角。包含“体感传感器”。"},
+};
+using TextTable = std::pair<std::string_view, const char*>;
+
+struct Language {
+    std::string_view code; // as the launcher names it (SPARTAN_UI_LANGUAGE)
+    const char* name;      // in the language itself
+    const TextTable* texts;
+    std::size_t count;
+};
+template <std::size_t N>
+constexpr Language Table(std::string_view code, const char* name, const TextTable (&texts)[N]) {
+    return {code, name, texts, N};
+}
+/// The menu's languages, in the order of the language list; 0 is English.
+inline constexpr Language Languages[] = {
+    {"en", "English", nullptr, 0},
+    Table("pt", "Português (Brasil)", PortugueseText),
+    Table("es", "Español", SpanishText),
+    Table("fr", "Français", FrenchText),
+    Table("de", "Deutsch", GermanText),
+    Table("it", "Italiano", ItalianText),
+    Table("pl", "Polski", PolishText),
+    Table("tr", "Türkçe", TurkishText),
+    Table("id", "Bahasa Indonesia", IndonesianText),
+    Table("ru", "Русский", RussianText),
+    Table("cs", "Čeština", CzechText),
+    Table("zh", "中文", ChineseText),
+};
+inline constexpr int LanguageCount = int(sizeof(Languages) / sizeof(Languages[0]));
+inline std::atomic<int> language{0}; // index into Languages
+
+/// The index of a launcher language ("pt", "pt-BR", "zh_CN"...); 0 (English) for any other.
+inline int FindLanguage(std::string_view code) {
+    if (WantsChinese(code)) return LanguageCount - 1;
+    const std::string_view two = code.substr(0, 2);
+    for (int i = 1; i < LanguageCount; ++i) {
+        if (Languages[i].code == two && Languages[i].code != "zh") return i;
+    }
+    return 0;
+}
+
+/// Uses the language at once; Chinese only once its font is loaded (else English). Returns the
+/// index in use.
+inline int SetLanguage(int index) {
+    if (index < 0 || index >= LanguageCount) index = 0;
+    if (Languages[index].code == "zh" && !chinese_font) index = 0;
+    language = index;
+    chinese = Languages[index].code == "zh";
+    return index;
+}
+
+inline const char* Lookup(const Language& table, const char* text) {
+    for (std::size_t i = 0; i < table.count; ++i) {
+        if (table.texts[i].first == text) return table.texts[i].second;
+    }
+    return text;
+}
+
+inline const char* Tr(const char* text) {
+    if (!text) return text;
+    if (chinese) return Lookup(Languages[LanguageCount - 1], text);
+    const int index = language;
+    return index > 0 && index < LanguageCount ? Lookup(Languages[index], text) : text;
+}
+} // namespace SpartanUi

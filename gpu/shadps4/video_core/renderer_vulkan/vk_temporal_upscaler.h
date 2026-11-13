@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// spartanport: temporal upscaling of the HDR scene color (docs/upscaler.md). Off for SpartanPort
+// until its scene color, depth and camera constants are found (run.py). SPARTAN_UPSCALER=fsr3
+// runs FSR 3.1 (FireBurn/FSR-Vulkan, native Vulkan) on the scene color right before the
+// post-processing combine pass, with the scene depth and camera motion vectors, and writes the
+// result back so the game's own post, tonemap and UI continue unchanged (Native AA preset).
+//
+// Guest targets stay at 1920x1080. Host scene targets use output/preset dimensions,
+// resized at frame boundaries. At 1080p HDR reconstruction precedes post; other outputs
+// reconstruct tonemapped scene proxies before output-size UI/display composition.
+// SPARTAN_RENDER_RES retains the older startup-patched guest-resolution path.
+
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#include "common/types.h"
+#include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_frame_generation.h"
+#include "video_core/renderer_vulkan/vk_fsr4.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
+#include "video_core/texture_cache/image.h"
+
+struct FfxVkPortableUpscaleContext;
+
+namespace VideoCore {
+class TextureCache;
+}
+
+namespace Vulkan {
+
+class Instance;
+class Scheduler;
+class Runtime;
+class CameraMotion;
+class SceneTargets;
+
+class TemporalUpscaler {
+public:
+    TemporalUpscaler(const Instance& instance, Scheduler& scheduler,
+                     VideoCore::TextureCache& texture_cache, Runtime& runtime,
+                     CameraMotion& camera_motion, SceneTargets& scene_targets);
+    ~TemporalUpscaler();
+
+    [[nodiscard]] bool Enabled() const noexcept {
+        return enabled;
+    }
+
+    /// A draw into a full-size RGBA16F target with the scene depth: the scene color.
+    void OnSceneColor(VideoCore::ImageId color);
+
+    /// A blended (transparent) draw into the scene color:
+    /// first one of a frame snapshots the opaque scene for the reactive mask.
+    void OnBlendedSceneDraw();
+
+    /// Captures the finished HDR transparencies before the LDR composite replaces scene_color.
+    void OnSceneComposite();
+
+    /// Before a compute dispatch: the post-processing combine shader triggers the upscale.
+    void OnDispatch(u64 cs_hash);
+
+    /// God of War III: a draw whose pixel shader is the post-process composite, into the 8-bit
+    /// sRGB scene colour that the HUD and the display pass use next. The upscale runs before
+    /// the next draw or dispatch (RunPending), on the finished frame, before the HUD.
+    void OnPixelShader(u64 ps_hash, VideoCore::ImageId color);
+
+    /// Start of every draw and dispatch: runs the upscale queued by OnPixelShader.
+    void RunPending();
+
+    /// The temporal upscaler is the port's own TAA (God of War III's scene frames, camera found by
+    /// content, one jitter per scene); every other mode takes the FSR path.
+    [[nodiscard]] bool SceneTaa() const;
+    /// The upscaler's own sharpening is on (launcher setting and the menu's RCAS switch).
+    [[nodiscard]] bool SharpenOn() const;
+    /// FSR's own sharpness (0..1), from the menu's sharpening strength.
+    [[nodiscard]] float UpscalerSharpness() const;
+
+    /// Draws into this depth image are jittered: the scene depth, and the full-size copy the
+    /// transparent pass uses (same size as the scene depth, written by the game).
+    [[nodiscard]] bool JitterDepth(VideoCore::ImageId depth) const;
+
+    /// Start of a frame in the command stream (display pass).
+    bool OnFrameStart();
+    /// The first depth pre-pass draw of a scene (view-projection camera): this scene's jitter and
+    /// per-frame state, instead of the display pass's.
+    void OnSceneStart();
+    void PrintStatus();
+    void NoteSkip();
+    bool RasterScaling() const;
+    /// spartanport: LOD bias for scene materials, log2(render / output) while a reduced scene is
+    /// upscaled (0 at native size, for TAA and without an upscaler).
+    [[nodiscard]] float SceneMipBias() const;
+    /// FSR 3.1 with native HUD and text, before this frame's upscale: the scene's material draws take the
+    /// menu's texture detail (the TAA's own detection needs its camera; FSR has the depth pre-pass).
+    [[nodiscard]] bool FsrSceneTextures() const;
+    /// spartanport: the state RedirectColor/RedirectDepth/RasterScaling depend on, for memoizing a
+    /// draw's render state (Rasterizer::BeginRendering).
+    [[nodiscard]] u64 RedirectState() const noexcept {
+        return (u64(ui_phase) | u64(display_redirect) << 1 | u64(done_this_frame) << 2 |
+                u64(ui_color.index) << 8 | u64(ui_depth.index) << 36) ^
+               u64(frame_display) * 0x9E3779B97F4A7C15ull;
+    }
+
+
+    /// This frame's sub-pixel jitter in pixels (screen x right, y down); zero when off and after
+    /// the upscale (post and UI are not jittered).
+    [[nodiscard]] std::array<float, 2> Jitter() const noexcept {
+        return done_this_frame || composite_passed ? std::array<float, 2>{} : jitter;
+    }
+    /// Status line: scene draws by what happened to their jitter (0 shifted, 1 too small an
+    /// index count, 2 clipping disabled, 3 the jitter was zero).
+    void NoteJitterDraw(u32 kind) noexcept {
+        ++jitter_draws[kind & 3];
+    }
+    /// The composite of the scene was drawn since the last frame start (a repeated display
+    /// pass has none).
+    [[nodiscard]] bool CompositePassed() const noexcept {
+        return composite_passed;
+    }
+
+    // Scaled presets.
+
+    /// After identifying this draw's targets, before drawing any UI pixels. Menus use
+    /// spatial background copy and native UI, without needing scene depth or FSR history.
+    void OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId depth,
+                bool native_viewport);
+
+    /// SpartanPort (no HDR scene color, no trigger compute): every draw, before it runs, with its
+    /// pixel shader. The draw after the full-screen composite (ldr_trigger_ps, docs/upscaler.md)
+    /// runs FSR on the composite's RGBA8 sRGB result, before any HUD is drawn into it.
+    void OnGraphicsDraw(u64 ps_hash, VideoCore::ImageId color);
+    /// Before the composite this frame: scene draws still take the jitter.
+    [[nodiscard]] bool SceneOpen() const noexcept {
+        return !done_this_frame && !ldr_pending;
+    }
+
+    /// A pass's first color target: the last render-size RGBA8 target before the UI is the
+    /// game's finished frame.
+    void OnColorTarget(VideoCore::ImageId color);
+
+    struct Target {
+        vk::ImageView view;
+        vk::ImageLayout layout;
+        u32 width, height;
+        bool native_ui = false;
+    };
+    /// Render target redirection (UI passes, display pass): false when not redirected.
+    /// `view` is the game's view of the image: redirected views mirror its format (sRGB) and,
+    /// for sampling, its channel swizzle.
+    bool RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewInfo& view,
+                       Target& target, u64 shader, bool replaces_color, bool has_depth);
+    bool RedirectDepth(VideoCore::ImageId depth, Target& target);
+    /// A sampled image replaced by the upscaled frame (the display pass).
+    bool RedirectSampled(VideoCore::ImageId image, const VideoCore::ImageViewInfo& info,
+                         vk::ImageView& view, vk::ImageLayout& layout);
+    /// Whether RedirectSampled would replace `image` (it may record a barrier then).
+    [[nodiscard]] bool RedirectsSampled(VideoCore::ImageId image) const;
+
+    /// spartanport: frame generation, fed after the upscale (RunScaled), asked by the presenter.
+    [[nodiscard]] FrameGeneration& GetFrameGeneration() noexcept {
+        return *frame_generation;
+    }
+
+    /// Presenter: the output-size display buffer standing in for the guest one at `address`.
+    struct Display {
+        vk::Image image;
+        vk::Format format;
+        u32 width, height;
+    };
+    bool DisplayOverride(VAddr address, Display& display);
+
+private:
+    /// spartanport: views of guest images the upscaler reads, kept across frames: FSR 4 registers
+    /// images by view in a registry of eight (a new view per frame filled it at Native AA).
+    vk::ImageView CachedView(const VideoCore::Image& image, vk::Format format,
+                             vk::ImageAspectFlags aspect);
+    struct ViewEntry {
+        vk::Image image;
+        u64 uid = 0;
+        vk::Format format{};
+        vk::ImageAspectFlags aspect{};
+        vk::ImageView view;
+        u64 last_use = 0;
+    };
+    std::array<ViewEntry, 6> view_cache{};
+    u64 view_uses = 0;
+
+    void Run();
+    /// The 8-bit sRGB scene colour: the port's TAA on the tonemapped frame, native resolution.
+    void RunSceneTaa();
+    void RunScaled();
+    /// FSR 3 at 1:1 on an RGBA8 (sRGB) scene color, written back with a blit.
+    void RunLdr();
+    /// Stencil reactive mask into reactive_image (w x h): false when off or without stencil.
+    bool RecordStencilReactive(vk::CommandBuffer cmdbuf, VideoCore::Image& depth, vk::Format depth_format,
+                               u32 w, u32 h);
+    void RunUiOnly(VideoCore::ImageId color, VideoCore::ImageId depth);
+    void EnsureUiResources(u32 width, u32 height, vk::Format color, vk::Format depth);
+    void PrepareUiDepth(VideoCore::ImageId depth);
+    /// Render size below the scaled-preset output size (the resolution patch is on).
+    [[nodiscard]] bool Scaled() const;
+    /// A target of the patched render size: the game allocates it with aligned dimensions
+    /// (a 1916x1078 scene in 1916x1080 targets).
+    [[nodiscard]] bool RenderTarget(u32 w, u32 h) const {
+        if (!scaled_session) return w == 1920 && h == 1080;
+        return w >= render_width && h >= render_height && w < render_width + 8 &&
+               h < render_height + 8;
+    }
+    /// The scene's size inside a `w` x `h` render target: the game's viewport.
+    [[nodiscard]] std::array<u32, 2> SceneSize(u32 w, u32 h) const;
+    // The scene color is drawn into a reduced SceneTargets proxy (live presets).
+    [[nodiscard]] bool ReducedScene(const VideoCore::Image& color) const;
+    /// Available and switched on (menu setting, toggle 1 << 24).
+    [[nodiscard]] bool Active() const;
+    [[nodiscard]] bool ReactiveOn() const;
+    bool EnsureResources(u32 width, u32 height, u32 out_width, u32 out_height, bool hdr);
+    void CreatePipelines();
+    /// Records the reactive mask pass; false when there is no snapshot this frame.
+    bool RecordReactive(vk::ImageView color_view);
+    /// FSR 4 is selected, possible in this session (not SPARTAN_RENDER_RES) and has not failed.
+    [[nodiscard]] bool UseFsr4() const;
+    /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
+    bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
+                    u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
+                    vk::Format ldr_format = vk::Format::eR8G8B8A8Unorm);
+    /// The images behind the views RecordTaa is given, which XeSS wants as well.
+    struct XessInputs {
+        vk::Image color, depth;
+        vk::Format color_format, depth_format;
+        u32 width, height;
+        bool has_mask; ///< the stencil mask is in reactive_image (XeSS's responsive mask)
+    };
+    void RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView depth,
+                   const XessInputs* xess_inputs = nullptr);
+    /// XeSS in place of the TAA's accumulation (upscaler xess); false: the TAA runs this frame.
+    bool RecordXess(vk::CommandBuffer cmdbuf, const XessInputs& inputs, vk::ImageView color,
+                    vk::ImageView depth);
+    /// Sharpness above 1 for FSR 3/4 (their RCAS stops at 1): one more RCAS pass over the target
+    /// (output_image, or the 8-bit UI image with ldr) in General layout after the upscaler.
+    void ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w, u32 h);
+    /// RCAS pass of ours over `target` (the output image, or the 8-bit UI image when `ldr`), strength 0..2.
+    void SharpenImage(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w, u32 h, float strength);
+
+    const Instance& instance;
+    Scheduler& scheduler;
+    VideoCore::TextureCache& texture_cache;
+    Runtime& runtime;
+    CameraMotion& camera_motion;
+    SceneTargets& scene_targets;
+    int applied_preset = -1;
+    int applied_upscaler = -1;
+    bool dispatched_last_frame = false;
+    u32 frames_since_run = 1000; ///< display passes since a scene was last upscaled
+    u32 composite_status = 0, scene_counter = 0, done_skips = 0;
+    const char* logged_skip = "none";
+    u32 status_frames = 0;  // frames since the last status line in the log
+    u32 trigger_seen = 0;   // times the frame's trigger dispatch was seen since then
+    u32 composite_seen = 0; // composite draws seen since then (God of War III)
+    u32 ldr_runs = 0;       // upscales of the 8-bit scene colour since then
+    const char* skip_reason = "none"; // why the last queued upscale did not run
+    bool composite_pending = false;
+    bool composite_passed = false;
+    std::array<u32, 4> jitter_draws{};
+    bool jitter_enabled = false; ///< the scene is finished this frame: nothing after it is jittered
+    u64 composite_ps = 0x0c20ededc9e7c40c; // SPARTAN_UPSCALER_COMPOSITE_PS overrides it
+    bool last_active = false, last_jitter = false;
+
+
+    bool enabled = false;
+    bool failed = false;
+    u64 trigger_hash = 0x9a9cf8a9;
+    VideoCore::ImageId scene_color{};
+    u64 scene_color_uid = 0; ///< image_uid of scene_color when it was recorded
+    /// scene_color and the scene depth are still the images the texture cache holds.
+    [[nodiscard]] bool SceneColorLive() const;
+    [[nodiscard]] bool SceneImagesLive() const;
+    /// SpartanPort's composite pass (frame_20261024-233122_3.txt pass #73): its target is the scene
+    /// color before the HUD. SPARTAN_UPSCALER_LDR_TRIGGER overrides it (hex).
+    u64 ldr_trigger_ps = 0x0c20ededc9e7c40cull;
+    bool ldr_pending = false;
+    bool ldr_scaled = false; ///< this session's scaled frames come from the composite (RunScaled)
+    bool done_this_frame = false;
+    u32 preset_file_frames = 0; ///< SPARTAN_PRESET_FILE polling
+    int applied_output = -1;
+    bool snapshot_taken = false;
+    bool opaque_valid = false;
+    bool mask_ready = false;
+    std::array<float, 2> jitter{};
+    u32 jitter_index = 0;
+    bool reset = true;
+    u64 frame_id = 0;
+    std::chrono::steady_clock::time_point last_frame{};
+
+    u32 width = 0, height = 0;             ///< render size
+    u32 out_width = 0, out_height = 0;     ///< output size of the context
+    bool context_hdr = true;
+    u32 target_width = 1920, target_height = 1080; ///< output size of scaled presets
+    u64 ui_trigger_vs = 0x34e8a281;
+    VideoCore::ImageId ldr_target{};
+    VideoCore::ImageId ui_color{}, ui_depth{};
+    bool ui_phase = false;         ///< from the upscale to the next display pass
+    bool display_seeded = false;
+    bool sampled_ui = false;
+    bool display_redirect = false; ///< the display pass of an upscaled frame
+    /// The display buffer this frame's display pass drew into the upscaled image: later passes
+    /// of the same frame (the water refraction) read and draw that image, not the guest one.
+    VAddr frame_display = 0;
+    bool ui_read_barrier = false;
+    VideoCore::UniqueImage ui_image;
+    VideoCore::UniqueImage ui_depth_image;
+    vk::UniqueImageView ui_view;
+    vk::UniqueImageView ui_depth_view;
+    bool depth_blit = false;
+    bool scaled_session = false;
+    u32 ui_width = 0, ui_height = 0;
+    u32 render_width = 0, render_height = 0;
+    vk::Format ui_format = vk::Format::eUndefined;
+    vk::Format ui_depth_format = vk::Format::eUndefined;
+    /// Views of the port's images in the formats/swizzles the game's views use.
+    struct MirrorView {
+        vk::Format format;
+        vk::ComponentMapping mapping;
+        vk::UniqueImageView view;
+    };
+    vk::ImageView Mirror(vk::Image image, std::vector<MirrorView>& views, vk::Format format,
+                         vk::ComponentMapping mapping);
+    std::vector<MirrorView> ui_views;
+    struct DisplayImage {
+        VideoCore::UniqueImage image;
+        std::vector<MirrorView> views;
+        vk::Format format{};
+        u32 width = 0, height = 0;
+        bool valid = false;
+        /// SpartanPort's display pass samples the frame in render-size coordinates: the port copies
+        /// the UI image itself and the game's copy draws land here instead.
+        VideoCore::UniqueImage scratch;
+        std::vector<MirrorView> scratch_views;
+    };
+    std::mutex display_mutex;
+    std::unordered_map<VAddr, DisplayImage> displays;
+    FfxVkPortableUpscaleContext* context = nullptr;
+    bool resources_ready = false; ///< images below match width/height/out size
+    bool resources_fsr4 = false;  ///< made for FSR 4 (no FSR 3 context)
+    bool resources_taa = false;
+    std::unique_ptr<Fsr4Upscaler> fsr4;
+    std::unique_ptr<XessAa> xess;
+    bool xess_active = false; ///< the last frame was made by XeSS (its history is not the TAA's)
+    std::unique_ptr<FrameGeneration> frame_generation;
+    bool fsr4_failed = false;
+    VideoCore::UniqueImage motion_image;
+    VideoCore::UniqueImage output_image;
+    vk::UniqueImageView motion_view;
+    vk::UniqueImageView output_view;
+    VideoCore::UniqueImage opaque_image;   ///< scene color before the blended draws
+    VideoCore::UniqueImage reactive_image; ///< R8 reactive mask
+    vk::UniqueImageView opaque_view;
+    vk::UniqueImageView reactive_view;
+    vk::UniqueDescriptorSetLayout reactive_desc_layout;
+    vk::UniquePipelineLayout reactive_pipeline_layout;
+    vk::UniquePipeline reactive_pipeline;
+    vk::UniqueDescriptorSetLayout stencil_reactive_desc_layout;
+    vk::UniquePipelineLayout stencil_reactive_pipeline_layout;
+    vk::UniquePipeline stencil_reactive_pipeline;
+    vk::UniqueDescriptorSetLayout merge_desc_layout;
+    vk::UniquePipelineLayout merge_pipeline_layout;
+    vk::UniquePipeline merge_pipeline;
+    std::array<VideoCore::UniqueImage, 2> taa_history;
+    std::array<vk::UniqueImageView, 2> taa_history_views;
+    u32 taa_next = 0;
+    vk::UniqueSampler taa_sampler;
+    // FSR gets the scene depth as plain clip z / w (the game's range is 0.5..1).
+    vk::UniqueDescriptorSetLayout ldr_alpha_desc_layout;
+    vk::UniquePipelineLayout ldr_alpha_pipeline_layout;
+    vk::UniquePipeline ldr_alpha_pipeline;
+    vk::UniqueDescriptorSetLayout taa_desc_layout;
+    vk::UniquePipelineLayout taa_pipeline_layout;
+    vk::UniquePipeline taa_pipeline;
+    vk::UniqueDescriptorSetLayout taa_sharpen_desc_layout;
+    vk::UniquePipelineLayout taa_sharpen_pipeline_layout;
+    vk::UniquePipeline taa_sharpen_pipeline;
+    vk::UniquePipeline taa_sharpen_ldr_pipeline;
+    // ExtraSharpen: a copy of the upscaled frame (RCAS reads neighbours) and the target views.
+    VideoCore::UniqueImage extra_sharpen_image;
+    vk::UniqueImageView extra_sharpen_view;
+    u32 extra_sharpen_width = 0, extra_sharpen_height = 0;
+    vk::UniqueImageView ui_storage_view;
+};
+
+} // namespace Vulkan

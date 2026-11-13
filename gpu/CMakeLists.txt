@@ -1,0 +1,646 @@
+# spartanport GPU library: shadPS4 video core + shader recompiler + Gnm/VideoOut
+# drivers, adapted to the native_probe runtime through shims in shim/.
+cmake_minimum_required(VERSION 3.24)
+project(spartanportgpu LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+# Frame pointers keep the loader's thread dumps (watchdog, SIGUSR2 sampling) walkable.
+add_compile_options(-fno-omit-frame-pointer)
+
+# spartanport: link-time optimization (SPARTAN_LTO, default on) and profile-guided optimization
+# (SPARTAN_PGO: off, generate = instrumented build writing into SPARTAN_PGO_DIR, use = build with that
+# profile). Covers spartanportgpu and the static libraries linked into it. No -march: the same build
+# runs on the Steam Deck.
+option(SPARTAN_LTO "Link-time optimization of spartanportgpu" ON)
+set(SPARTAN_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
+set(SPARTAN_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
+if (SPARTAN_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT spartanport_ipo_ok OUTPUT spartanport_ipo_error)
+    if (spartanport_ipo_ok)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    else()
+        message(WARNING "LTO unavailable: ${spartanport_ipo_error}")
+    endif()
+endif()
+if (SPARTAN_PGO STREQUAL "generate")
+    # Atomic counters: the GPU, recording, preparation and copy threads run the same code.
+    add_compile_options(-fprofile-generate=${SPARTAN_PGO_DIR} -fprofile-update=atomic)
+    add_link_options(-fprofile-generate=${SPARTAN_PGO_DIR})
+    add_compile_definitions(SPARTAN_PGO_GENERATE)
+elseif (SPARTAN_PGO STREQUAL "use")
+    # Partial training keeps unprofiled code optimized normally; counters from concurrent
+    # threads can be slightly inconsistent (correction). Functions changed since the profile
+    # (or built differently for it, spartanportgpu_init) are compiled without it.
+    add_compile_options(-fprofile-use=${SPARTAN_PGO_DIR} -fprofile-partial-training
+                        -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
+endif()
+
+find_package(Vulkan REQUIRED)
+find_package(fmt REQUIRED)
+find_package(Boost REQUIRED)
+# spartanport (Windows): MSYS2 has no magic_enum/miniz packages; the submodules are used instead.
+find_package(magic_enum QUIET)
+if (NOT magic_enum_FOUND)
+    add_library(magic_enum INTERFACE)
+    add_library(magic_enum::magic_enum ALIAS magic_enum)
+    target_include_directories(magic_enum INTERFACE third_party/magic_enum/include
+                                                    third_party/magic_enum/include/magic_enum)
+endif()
+find_package(tsl-robin-map REQUIRED)
+find_package(VulkanMemoryAllocator CONFIG QUIET)
+if (NOT VulkanMemoryAllocator_FOUND)
+    # MSYS2 ships the header (include/vma/vk_mem_alloc.h) without a CMake package.
+    find_path(VMA_INCLUDE_DIR vk_mem_alloc.h PATH_SUFFIXES vma REQUIRED)
+    add_library(VulkanMemoryAllocator INTERFACE)
+    add_library(GPUOpen::VulkanMemoryAllocator ALIAS VulkanMemoryAllocator)
+    target_include_directories(VulkanMemoryAllocator INTERFACE ${VMA_INCLUDE_DIR})
+endif()
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
+pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+if (NOT WIN32)
+    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+endif()
+find_package(miniz QUIET)
+if (NOT miniz_FOUND)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    add_subdirectory(third_party/miniz EXCLUDE_FROM_ALL)
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
+    add_library(miniz::miniz ALIAS miniz)
+endif()
+find_package(Zydis REQUIRED)
+find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
+
+set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
+
+# spartanport: FSR 3.1 temporal upscaling / frame generation, native Vulkan (MIT, FireBurn/FSR-Vulkan).
+set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+
+# Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
+set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
+set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
+set(SHADER_DIR ${SHADER_INCLUDE}/video_core/host_shaders)
+set(SHADER_HEADERS "")
+function(add_host_shader FILENAME SHADER_NAME)
+    set(OUT ${SHADER_DIR}/${SHADER_NAME}.h)
+    string(TOUPPER ${SHADER_NAME} SYMBOL)
+    set(DEFINES ${ARGN})
+    list(TRANSFORM DEFINES PREPEND "-D")
+    add_custom_command(OUTPUT ${OUT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
+        COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${OUT} --vn ${SYMBOL} ${DEFINES} ${SHADER_SRC}/${FILENAME}
+        COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${OUT}" -P ${SHADER_SRC}/AddShaderHeaderInclude.cmake
+        DEPENDS ${SHADER_SRC}/${FILENAME} ${SHADER_SRC}/smaa/SMAA.h VERBATIM)
+    set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
+endfunction()
+add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
+add_host_shader(color_to_ms_depth.frag color_to_ms_depth_fallback_frag SAMPLE_FALLBACK=1)
+add_host_shader(ms_image_blit.frag ms_image_blit_frag)
+add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
+add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)
+add_host_shader(fs_tri.vert fs_tri_vert)
+add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)
+add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
+add_host_shader(post_process.frag post_process_frag)
+# spartanport: anti-aliasing of the finished frame (host_passes/aa_pass.cpp): FXAA and the three SMAA passes.
+add_host_shader(fxaa.comp fxaa_comp)
+add_host_shader(smaa.comp smaa_edges_comp SMAA_EDGES=1)
+add_host_shader(smaa.comp smaa_weights_comp SMAA_WEIGHTS=1)
+add_host_shader(smaa.comp smaa_blend_comp SMAA_BLEND=1)
+add_host_shader(camera_motion.comp camera_motion_comp)
+add_host_shader(camera_motion_vp.comp camera_motion_vp_comp)
+add_host_shader(ldr_alpha.comp ldr_alpha_comp)
+add_host_shader(upscale_merge.comp upscale_merge_comp)
+add_host_shader(upscale_reactive.comp upscale_reactive_comp)
+add_host_shader(stencil_reactive.comp stencil_reactive_comp)
+add_host_shader(fg_depth.comp fg_depth_comp)
+add_host_shader(fg_hud.comp fg_hud_comp)
+add_host_shader(taa.comp taa_comp)
+add_host_shader(taa_sharpen.comp taa_sharpen_comp)
+add_host_shader(taa_sharpen.comp taa_sharpen_ldr_comp LDR_OUTPUT=1)
+add_host_shader(buffer_multi_copy.comp buffer_multi_copy_comp)
+add_host_shader(depth_resample.frag depth_resample_frag)
+add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
+add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
+add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
+foreach(BPP IN ITEMS 8 16 32 64 96 128)
+    add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
+    add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
+endforeach()
+add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
+
+file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
+file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
+list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
+set(COMMON
+    shadps4/common/decoder.cpp shadps4/common/error.cpp
+    shadps4/common/io_file.cpp shadps4/common/native_clock.cpp shadps4/common/number_utils.cpp
+    shadps4/common/path_util.cpp shadps4/common/rdtsc.cpp shadps4/common/spin_lock.cpp shadps4/common/recursive_lock.cpp
+    shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
+    shim/common/logging/log.cpp)
+file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+# Windows: a DLL cannot leave the runtime_* symbols for spartanport-probe.exe to resolve, so the
+# library is static there and linked into the executable.
+if (WIN32)
+    set(SPARTANGPU_KIND STATIC)
+else()
+    set(SPARTANGPU_KIND SHARED)
+endif()
+add_library(spartanportgpu ${SPARTANGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+    shadps4/core/libraries/gnmdriver/gnmdriver.cpp
+    shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
+    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
+    shadps4/core/libraries/videodec/video_utils.cpp)
+add_dependencies(spartanportgpu host_shaders)
+# In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
+# embedded Cyrillic font (third_party/fonts).
+target_sources(spartanportgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/backends/imgui_impl_vulkan.cpp)
+target_include_directories(spartanportgpu PRIVATE third_party/imgui third_party/imgui/backends)
+target_compile_definitions(spartanportgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+    SPARTAN_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf"
+    SPARTAN_TITLE_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../launcher/Cinzel-Black.ttf")
+set_source_files_properties(shim/spartanport_overlay.cpp PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf;${CMAKE_CURRENT_SOURCE_DIR}/../launcher/Cinzel-Black.ttf")
+target_include_directories(spartanportgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include third_party/xess)
+target_compile_definitions(spartanportgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
+target_compile_options(spartanportgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
+# Runtime symbols (runtime_memory_*, runtime_process_*) resolve against spartanport-probe.
+if (NOT WIN32)
+    target_link_options(spartanportgpu PRIVATE -Wl,--allow-shlib-undefined)
+endif()
+target_link_libraries(spartanportgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan
+    ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+target_link_libraries(spartanportgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+target_include_directories(spartanportgpu PRIVATE third_party/xbyak)
+if (WIN32)
+    # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
+    # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
+    target_compile_definitions(spartanportgpu PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(spartanportgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/spartanport_win_compat.h)
+    target_link_libraries(spartanportgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm pdh)
+else()
+    target_link_libraries(spartanportgpu PUBLIC PkgConfig::X11)
+endif()
+
+# spartanport (Windows): spartanportgpu is a static library there, so the loader and the HLE runtime are
+# linked here, where CMake knows its dependencies (build.sh builds them with ninja).
+if (WIN32)
+    enable_language(RC)
+    file(GLOB SPARTAN_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
+    file(GLOB SPARTAN_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
+    add_library(atrac9 STATIC ${SPARTAN_ATRAC9})
+    target_compile_options(atrac9 PRIVATE -w)
+    set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
+    add_executable(spartanport-probe ../src/probe.c ${SPARTAN_RUNTIME} ../src/compat_win.c ../src/cpu_check.c ../src/vulkan_smoke.c
+        ../src/isa_rewrite.c ../src/isa_emulate.c
+        ../packaging/windows/spartanport-probe.rc)
+    set_target_properties(spartanport-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(spartanport-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror>)
+    target_include_directories(spartanport-probe PRIVATE .. ../src)
+    target_link_libraries(spartanport-probe PRIVATE spartanportgpu atrac9 onecore bcrypt ws2_32 -pthread)
+    # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
+    # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
+    target_link_options(spartanport-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    # spartanport: runtime unit tests (ninja -C out/gpu mp3-test videodec-test services-test).
+    add_executable(mp3-test EXCLUDE_FROM_ALL ../tests/test_mp3.c ../src/runtime_mp3.c ../src/compat_win.c)
+    add_executable(videodec-test EXCLUDE_FROM_ALL ../tests/test_videodec.c ../src/compat_win.c)
+    add_executable(services-test EXCLUDE_FROM_ALL ../tests/test_services.c ../src/compat_win.c)
+    foreach(test mp3-test videodec-test services-test)
+        set_target_properties(${test} PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+        target_compile_options(${test} PRIVATE -Wall -Wextra -Werror)
+        target_include_directories(${test} PRIVATE .. ../src)
+        target_link_libraries(${test} PRIVATE atrac9 PkgConfig::FFMPEG bcrypt -pthread)
+    endforeach()
+    add_executable(pad-map-test EXCLUDE_FROM_ALL ../tests/test_pad_map.c ../src/compat_win.c)
+    set_target_properties(pad-map-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(pad-map-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(pad-map-test PRIVATE .. ../src)
+    target_link_libraries(pad-map-test PRIVATE PkgConfig::SDL3 bcrypt -pthread)
+    add_executable(audio-test EXCLUDE_FROM_ALL ../tests/test_audio.c ../src/compat_win.c)
+    set_target_properties(audio-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(audio-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(audio-test PRIVATE .. ../src)
+    target_link_libraries(audio-test PRIVATE PkgConfig::SDL3 bcrypt -pthread)
+    add_executable(audio-downmix-test EXCLUDE_FROM_ALL ../tests/test_audio_downmix.c ../src/compat_win.c)
+    set_target_properties(audio-downmix-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(audio-downmix-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(audio-downmix-test PRIVATE .. ../src)
+    target_link_libraries(audio-downmix-test PRIVATE PkgConfig::SDL3 bcrypt -pthread)
+    add_executable(cpu-check-test EXCLUDE_FROM_ALL ../tests/test_cpu_check.c)
+    set_target_properties(cpu-check-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(cpu-check-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(cpu-check-test PRIVATE .. ../src)
+    # isa_emulate runs inside guest code: no XMM/YMM. The test runs the real instructions as its oracle.
+    add_executable(isa-emulate-test EXCLUDE_FROM_ALL ../tests/test_isa_emulate.c ../src/isa_emulate.c)
+    set_source_files_properties(../src/isa_emulate.c PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only")
+    set_source_files_properties(../tests/test_isa_emulate.c PROPERTIES COMPILE_OPTIONS "-mbmi;-mlzcnt;-mmovbe")
+    set_target_properties(isa-emulate-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(isa-emulate-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(isa-emulate-test PRIVATE .. ../src)
+    # Stubs and patched sites run for real in an RWX region; the fixture path is the first argument.
+    add_executable(isa-stub-test EXCLUDE_FROM_ALL ../tests/test_isa_stub.c ../src/isa_rewrite.c ../src/isa_emulate.c)
+    set_source_files_properties(../tests/test_isa_stub.c PROPERTIES COMPILE_OPTIONS "-mbmi;-mlzcnt")
+    set_target_properties(isa-stub-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(isa-stub-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(isa-stub-test PRIVATE .. ../src)
+    target_link_libraries(isa-stub-test PRIVATE bcrypt -pthread)
+    add_executable(tsc-clock-test EXCLUDE_FROM_ALL ../tests/test_tsc_clock.c ../src/compat_win.c)
+    set_target_properties(tsc-clock-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(tsc-clock-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(tsc-clock-test PRIVATE .. ../src)
+    target_link_libraries(tsc-clock-test PRIVATE bcrypt -pthread)
+    # Memory another program holds in the PS4 range at start-up (#1075).
+    add_executable(memory-reserve-test EXCLUDE_FROM_ALL ../tests/test_memory_reserve.c ../src/compat_win.c)
+    set_target_properties(memory-reserve-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(memory-reserve-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(memory-reserve-test PRIVATE .. ../src)
+    target_link_libraries(memory-reserve-test PRIVATE onecore bcrypt -pthread)
+    target_link_options(memory-reserve-test PRIVATE -Wl,--disable-high-entropy-va)
+    add_executable(spartanport-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/spartanport-gpu-capabilities.rc)
+    target_include_directories(spartanport-gpu-capabilities PRIVATE shadps4)
+    target_link_libraries(spartanport-gpu-capabilities PRIVATE Vulkan::Vulkan)
+    # "Play SpartanPort.exe": the game with the launcher's saved settings, no launcher window.
+    add_executable(spartanport-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
+    target_compile_options(spartanport-play PRIVATE -municode)
+    target_link_options(spartanport-play PRIVATE -municode)
+endif()
+
+# Explicit test targets; neither launches the game nor needs a Vulkan device.
+add_executable(slot-vector-test EXCLUDE_FROM_ALL ../tests/test_slot_vector.cpp
+    shim/common/slot_vector_pages.cpp)
+target_compile_options(slot-vector-test PRIVATE -UNDEBUG -D_DEBUG -Wall -Wextra -Werror)
+target_include_directories(slot-vector-test PRIVATE shim shadps4)
+target_compile_definitions(slot-vector-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(slot-vector-test PRIVATE fmt::fmt)
+add_executable(subresource-extent-test EXCLUDE_FROM_ALL ../tests/test_subresource_extent.cpp)
+target_compile_options(subresource-extent-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(subresource-extent-test PRIVATE shim shadps4)
+target_link_libraries(subresource-extent-test PRIVATE fmt::fmt)
+find_package(Threads REQUIRED)
+add_executable(irq-controller-test EXCLUDE_FROM_ALL ../tests/test_irq_controller.cpp
+    shim/common/assert.cpp shim/common/logging/log.cpp)
+target_include_directories(irq-controller-test PRIVATE shim shadps4)
+target_compile_options(irq-controller-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(irq-controller-test PRIVATE fmt::fmt magic_enum::magic_enum Threads::Threads)
+add_executable(shader-user-data-test EXCLUDE_FROM_ALL ../tests/test_shader_user_data.cpp
+    shadps4/shader_recompiler/frontend/fetch_shader.cpp
+    shadps4/shader_recompiler/frontend/decode.cpp
+    shadps4/shader_recompiler/frontend/format.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_options(shader-user-data-test PRIVATE -UNDEBUG)
+target_include_directories(shader-user-data-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(shader-user-data-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+if (WIN32)
+    # The guarded guest read calls spartanport_setjmp (src/compat_win.c), whose compat_random needs bcrypt.
+    target_sources(shader-user-data-test PRIVATE ../src/compat_win.c)
+    target_link_libraries(shader-user-data-test PRIVATE onecore bcrypt)
+endif()
+add_executable(cache-storage-test EXCLUDE_FROM_ALL ../tests/test_cache_storage.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(cache-storage-test PRIVATE
+    $<TARGET_PROPERTY:spartanportgpu,INCLUDE_DIRECTORIES>)
+target_link_libraries(cache-storage-test PRIVATE spartanportgpu)
+target_compile_options(cache-storage-test PRIVATE -UNDEBUG -fPIC)
+if (WIN32)
+    target_sources(cache-storage-test PRIVATE ../src/compat_win.c)
+    target_link_libraries(cache-storage-test PRIVATE onecore)
+endif()
+add_executable(pipeline-binary-cache-test EXCLUDE_FROM_ALL ../tests/test_pipeline_binary_cache.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_definitions(pipeline-binary-cache-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(pipeline-binary-cache-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(pipeline-binary-cache-test PRIVATE spartanportgpu)
+target_compile_options(pipeline-binary-cache-test PRIVATE -fPIC)
+if (WIN32)
+    target_sources(pipeline-binary-cache-test PRIVATE ../src/compat_win.c)
+    target_compile_definitions(pipeline-binary-cache-test PRIVATE sigjmp_buf=spartanport_jmp_buf)
+    target_compile_options(pipeline-binary-cache-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
+    target_link_libraries(pipeline-binary-cache-test PRIVATE onecore)
+endif()
+add_executable(pipeline-binary-initialization-test EXCLUDE_FROM_ALL
+    ../tests/test_pipeline_binary_initialization.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_definitions(pipeline-binary-initialization-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(pipeline-binary-initialization-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(pipeline-binary-initialization-test PRIVATE spartanportgpu)
+target_compile_options(pipeline-binary-initialization-test PRIVATE -fPIC)
+if (WIN32)
+    target_sources(pipeline-binary-initialization-test PRIVATE ../src/compat_win.c)
+    target_compile_definitions(pipeline-binary-initialization-test PRIVATE sigjmp_buf=spartanport_jmp_buf)
+    target_compile_options(pipeline-binary-initialization-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
+    target_link_libraries(pipeline-binary-initialization-test PRIVATE onecore)
+endif()
+set_source_files_properties(../tests/test_pipeline_binary_cache.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+add_executable(serdes-test EXCLUDE_FROM_ALL ../tests/test_serdes.cpp)
+target_compile_options(serdes-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(serdes-test PRIVATE shim shadps4)
+target_link_libraries(serdes-test PRIVATE fmt::fmt)
+add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
+target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(motion-history-test PRIVATE ..)
+add_executable(motion-shader-test EXCLUDE_FROM_ALL ../tests/test_motion_shaders.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(motion-shader-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(motion-shader-test PRIVATE spartanportgpu)
+add_executable(png-decode-test EXCLUDE_FROM_ALL ../tests/test_png_decode.cpp shim/spartanport_png.cpp)
+target_compile_options(png-decode-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(png-decode-test PRIVATE PkgConfig::FFMPEG)
+add_executable(trophy-toast-test EXCLUDE_FROM_ALL ../tests/test_trophy_toast.cpp
+    shim/spartanport_trophy_toast_model.cpp shim/spartanport_trophy_media.cpp shim/spartanport_trophy_texts.cpp
+    shim/spartanport_png.cpp)
+target_include_directories(trophy-toast-test PRIVATE shim)
+target_compile_options(trophy-toast-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(trophy-toast-test PRIVATE PkgConfig::FFMPEG)
+# The overlay drawn offscreen (tools/overlay_preview.cpp): its own code through ImGui's SDL software
+# renderer, for working on its look without the game and for the documentation's pictures.
+add_executable(overlay-preview EXCLUDE_FROM_ALL tools/overlay_preview.cpp
+    third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp)
+# The overlay's source is compiled here as in the library: same definitions, includes and options.
+target_include_directories(overlay-preview PRIVATE $<TARGET_PROPERTY:spartanportgpu,INCLUDE_DIRECTORIES>)
+target_compile_definitions(overlay-preview PRIVATE $<TARGET_PROPERTY:spartanportgpu,COMPILE_DEFINITIONS>)
+target_compile_options(overlay-preview PRIVATE $<TARGET_PROPERTY:spartanportgpu,COMPILE_OPTIONS>)
+target_link_libraries(overlay-preview PRIVATE spartanportgpu)
+if (WIN32)
+    target_sources(overlay-preview PRIVATE ../src/compat_win.c)
+    target_link_libraries(overlay-preview PRIVATE onecore bcrypt ws2_32 -pthread)
+endif()
+add_executable(ui-language-test EXCLUDE_FROM_ALL ../tests/test_ui_language.cpp)
+target_include_directories(ui-language-test PRIVATE shim)
+target_compile_options(ui-language-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(aliasing-test EXCLUDE_FROM_ALL ../tests/test_aliasing.cpp
+    shadps4/video_core/texture_cache/aliasing.cpp shadps4/video_core/texture_cache/host_compatibility.cpp)
+target_compile_options(aliasing-test PRIVATE -UNDEBUG)
+target_include_directories(aliasing-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(aliasing-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+add_executable(blend-rewrite-test EXCLUDE_FROM_ALL ../tests/test_blend_rewrite.cpp)
+target_compile_options(blend-rewrite-test PRIVATE -UNDEBUG)
+target_include_directories(blend-rewrite-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(blend-rewrite-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+add_executable(depth-stencil-state-test EXCLUDE_FROM_ALL ../tests/test_depth_stencil_state.cpp)
+add_executable(record-data-test EXCLUDE_FROM_ALL ../tests/test_record_data.cpp)
+target_compile_options(record-data-test PRIVATE -UNDEBUG)
+target_include_directories(record-data-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(record-data-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+add_executable(async-compiler-test EXCLUDE_FROM_ALL ../tests/test_async_compiler.cpp)
+target_compile_options(async-compiler-test PRIVATE -UNDEBUG)
+target_include_directories(async-compiler-test PRIVATE shadps4)
+add_executable(warmup-inbox-test EXCLUDE_FROM_ALL ../tests/test_warmup_inbox.cpp)
+target_compile_options(warmup-inbox-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(warmup-inbox-test PRIVATE shadps4)
+add_executable(wave-stats-test EXCLUDE_FROM_ALL ../tests/test_wave_stats.cpp)
+target_compile_options(wave-stats-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(wave-stats-test PRIVATE shadps4)
+add_executable(pass-census-test EXCLUDE_FROM_ALL ../tests/test_pass_census.cpp)
+target_compile_options(pass-census-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(pass-census-test PRIVATE shadps4)
+add_executable(frame-capture-test EXCLUDE_FROM_ALL ../tests/test_frame_capture.cpp
+    shadps4/video_core/renderer_vulkan/vk_frame_capture.cpp)
+target_compile_options(frame-capture-test PRIVATE -UNDEBUG)
+target_include_directories(frame-capture-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(frame-capture-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+add_executable(lighting-test-knob-test EXCLUDE_FROM_ALL ../tests/test_lighting_test.cpp)
+target_compile_options(lighting-test-knob-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(lighting-test-knob-test PRIVATE shadps4)
+add_executable(movie-bars-test EXCLUDE_FROM_ALL ../tests/test_movie_bars.cpp)
+target_compile_options(movie-bars-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(movie-bars-test PRIVATE shadps4)
+add_executable(amd-paths-test EXCLUDE_FROM_ALL ../tests/test_amd_paths.cpp)
+target_compile_options(amd-paths-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(amd-paths-test PRIVATE shadps4)
+add_executable(no-msaa-test EXCLUDE_FROM_ALL ../tests/test_no_msaa.cpp
+    shadps4/video_core/amdgpu/pixel_format.cpp)
+target_compile_options(no-msaa-test PRIVATE -UNDEBUG)
+target_include_directories(no-msaa-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(no-msaa-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+add_executable(surface-format-test EXCLUDE_FROM_ALL ../tests/test_surface_format.cpp
+    shadps4/video_core/renderer_vulkan/liverpool_to_vk.cpp shadps4/video_core/amdgpu/pixel_format.cpp
+    shadps4/common/number_utils.cpp)
+target_compile_options(surface-format-test PRIVATE -UNDEBUG)
+target_include_directories(surface-format-test PRIVATE shim shadps4 third_party/gcn/include third_party/half/include)
+target_link_libraries(surface-format-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+add_executable(async-pipeline-cache-test EXCLUDE_FROM_ALL ../tests/test_async_pipeline_cache.cpp)
+target_compile_options(async-pipeline-cache-test PRIVATE -UNDEBUG)
+target_include_directories(async-pipeline-cache-test PRIVATE shadps4)
+target_link_libraries(async-pipeline-cache-test PRIVATE Vulkan::Vulkan)
+add_executable(async-fetch-snapshot-test EXCLUDE_FROM_ALL ../tests/test_async_fetch_snapshot.cpp
+    shadps4/shader_recompiler/frontend/fetch_shader.cpp
+    shadps4/shader_recompiler/frontend/decode.cpp
+    shadps4/shader_recompiler/frontend/format.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_options(async-fetch-snapshot-test PRIVATE -UNDEBUG)
+target_include_directories(async-fetch-snapshot-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(async-fetch-snapshot-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+if (WIN32)
+    # The guarded guest read calls spartanport_setjmp (src/compat_win.c), whose compat_random needs bcrypt.
+    target_sources(async-fetch-snapshot-test PRIVATE ../src/compat_win.c)
+    target_link_libraries(async-fetch-snapshot-test PRIVATE onecore bcrypt)
+endif()
+target_compile_options(depth-stencil-state-test PRIVATE -UNDEBUG)
+target_include_directories(depth-stencil-state-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(depth-stencil-state-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
+add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
+target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(ui-composition-test PRIVATE ..)
+
+add_executable(frame-generation-test EXCLUDE_FROM_ALL ../tests/test_frame_generation.cpp
+    shadps4/video_core/renderer_vulkan/frame_generation_policy.cpp)
+target_compile_options(frame-generation-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(frame-generation-test PRIVATE .. shadps4)
+
+add_executable(frame-generation-runtime-test EXCLUDE_FROM_ALL
+    ../tests/test_frame_generation_runtime.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(frame-generation-runtime-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(frame-generation-runtime-test PRIVATE -UNDEBUG -fPIC)
+set_source_files_properties(../tests/test_frame_generation_runtime.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(frame-generation-runtime-test PRIVATE spartanportgpu)
+
+add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)
+# The test's Vulkan-Hpp inline methods have a different set of platform extensions
+# from vk_platform.cpp. Keep them local and use an explicit dispatcher in the test.
+target_compile_options(scene-resolution-test PRIVATE -UNDEBUG -fPIC)
+set_source_files_properties(../tests/test_scene_resolution.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(scene-resolution-test PRIVATE spartanportgpu)
+add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
+set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(taa-shader-test PRIVATE spartanportgpu)
+add_dependencies(taa-shader-test host_shaders)
+# The anti-aliasing pass itself (not the whole library): FXAA and SMAA on synthetic images, on any Vulkan
+# device (Lavapipe works), under the validation layer when it is installed.
+add_executable(aa-pass-test EXCLUDE_FROM_ALL ../tests/test_aa_pass.cpp
+    shadps4/video_core/renderer_vulkan/host_passes/aa_pass.cpp shim/common/logging/log.cpp)
+target_include_directories(aa-pass-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
+target_compile_definitions(aa-pass-test PRIVATE BOOST_ASIO_STANDALONE)
+target_compile_options(aa-pass-test PRIVATE -UNDEBUG -fPIC -Wno-deprecated-declarations -Wno-missing-field-initializers)
+target_link_libraries(aa-pass-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator miniz::miniz Threads::Threads ${CMAKE_DL_LIBS})
+add_dependencies(aa-pass-test host_shaders)
+
+add_executable(reactive-shader-test EXCLUDE_FROM_ALL ../tests/test_reactive_shader.cpp)
+target_include_directories(reactive-shader-test PRIVATE ${SHADER_INCLUDE})
+target_compile_options(reactive-shader-test PRIVATE -UNDEBUG)
+target_link_libraries(reactive-shader-test PRIVATE Vulkan::Vulkan GPUOpen::VulkanMemoryAllocator)
+add_dependencies(reactive-shader-test host_shaders)
+
+add_executable(fg-motion-shader-test EXCLUDE_FROM_ALL ../tests/test_fg_motion_shader.cpp)
+target_include_directories(fg-motion-shader-test PRIVATE ${SHADER_INCLUDE})
+target_compile_options(fg-motion-shader-test PRIVATE -UNDEBUG)
+target_link_libraries(fg-motion-shader-test PRIVATE Vulkan::Vulkan GPUOpen::VulkanMemoryAllocator)
+add_dependencies(fg-motion-shader-test host_shaders)
+
+add_executable(view-projection-test EXCLUDE_FROM_ALL ../tests/test_view_projection.cpp)
+target_include_directories(view-projection-test PRIVATE shadps4)
+target_compile_options(view-projection-test PRIVATE -UNDEBUG)
+add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(camera-motion-test PRIVATE spartanportgpu)
+# spartanport: these tests link the static Windows spartanportgpu with the runtime stubs; shader
+# code in it now reads guest descriptors through the guarded read, which calls spartanport_setjmp
+# (src/compat_win.c).
+if (WIN32)
+    foreach(test motion-shader-test frame-generation-runtime-test scene-resolution-test
+            taa-shader-test camera-motion-test)
+        target_sources(${test} PRIVATE ../src/compat_win.c)
+        target_link_libraries(${test} PRIVATE onecore)
+    endforeach()
+endif()
+add_dependencies(camera-motion-test host_shaders)
+
+# spartanport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
+add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
+    shim/spartanport_settings.cpp)
+target_include_directories(upscaler-support-test PRIVATE shim)
+target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
+target_compile_definitions(upscaler-support-test PRIVATE
+    SPARTAN_SIZES_TABLE="${CMAKE_CURRENT_SOURCE_DIR}/../tests/upscale_render_sizes.txt")
+
+add_executable(fsr-driver-test EXCLUDE_FROM_ALL ../tests/test_fsr_driver.cpp
+    shadps4/video_core/renderer_vulkan/fsr_driver.cpp)
+target_include_directories(fsr-driver-test PRIVATE shim shadps4)
+target_compile_definitions(fsr-driver-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(fsr-driver-test PRIVATE -UNDEBUG)
+target_link_libraries(fsr-driver-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers
+    tsl::robin_map Threads::Threads)
+add_executable(orb-multiplier-test EXCLUDE_FROM_ALL ../tests/test_orb_multiplier.cpp
+    shim/spartanport_orbs.cpp shim/spartanport_settings.cpp)
+target_include_directories(orb-multiplier-test PRIVATE shim)
+target_compile_options(orb-multiplier-test PRIVATE -UNDEBUG)
+add_executable(stat-multipliers-test EXCLUDE_FROM_ALL ../tests/test_stat_multipliers.cpp
+    shim/spartanport_settings.cpp)
+target_include_directories(stat-multipliers-test PRIVATE shim)
+target_compile_options(stat-multipliers-test PRIVATE -UNDEBUG)
+add_executable(perf-overlay-test EXCLUDE_FROM_ALL ../tests/test_perf_overlay.cpp
+    shim/spartanport_settings.cpp)
+target_include_directories(perf-overlay-test PRIVATE shim)
+target_compile_options(perf-overlay-test PRIVATE -UNDEBUG)
+add_executable(chinese-ui-test EXCLUDE_FROM_ALL ../tests/test_chinese_ui.cpp
+    third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
+target_include_directories(chinese-ui-test PRIVATE shim third_party/imgui)
+target_compile_options(chinese-ui-test PRIVATE -UNDEBUG)
+target_compile_definitions(chinese-ui-test PRIVATE IMGUI_DISABLE_SSE)
+if (WIN32)
+    target_link_libraries(chinese-ui-test PRIVATE user32 gdi32 imm32)
+endif()
+add_executable(cheat-hooks-test EXCLUDE_FROM_ALL ../tests/test_cheat_hooks.cpp)
+target_compile_options(cheat-hooks-test PRIVATE -UNDEBUG)
+add_executable(signatures-test EXCLUDE_FROM_ALL ../tests/test_signatures.cpp)
+target_compile_options(signatures-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(readback-queue-test EXCLUDE_FROM_ALL ../tests/test_readback_queue.cpp)
+target_include_directories(readback-queue-test PRIVATE shadps4)
+target_compile_options(readback-queue-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(wait-diagnostics-test EXCLUDE_FROM_ALL ../tests/test_wait_diagnostics.cpp)
+target_include_directories(wait-diagnostics-test PRIVATE shadps4)
+target_compile_options(wait-diagnostics-test PRIVATE -UNDEBUG)
+add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
+    shim/spartanport_settings.cpp)
+target_include_directories(graphics-settings-test PRIVATE shim)
+target_compile_options(graphics-settings-test PRIVATE -UNDEBUG)
+add_executable(menu-confirm-swap-test EXCLUDE_FROM_ALL ../tests/test_menu_confirm_swap.cpp
+    shim/spartanport_settings.cpp)
+target_include_directories(menu-confirm-swap-test PRIVATE shim third_party/imgui)
+target_link_libraries(menu-confirm-swap-test PRIVATE PkgConfig::SDL3)
+target_compile_options(menu-confirm-swap-test PRIVATE -UNDEBUG)
+add_executable(depth-of-field-test EXCLUDE_FROM_ALL ../tests/test_depth_of_field.cpp)
+target_include_directories(depth-of-field-test PRIVATE shim)
+target_compile_options(depth-of-field-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(motion-blur-test EXCLUDE_FROM_ALL ../tests/test_motion_blur.cpp)
+target_include_directories(motion-blur-test PRIVATE shim)
+target_compile_options(motion-blur-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(actor-hook-test EXCLUDE_FROM_ALL ../tests/test_actor_hook.cpp)
+target_include_directories(actor-hook-test PRIVATE shim)
+target_compile_options(actor-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(qte-hook-test EXCLUDE_FROM_ALL ../tests/test_qte_hook.cpp)
+target_compile_options(qte-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(camera-hook-test EXCLUDE_FROM_ALL ../tests/test_camera_hook.cpp ../src/runtime_camera.c)
+target_include_directories(camera-hook-test PRIVATE ../src ..)
+target_compile_options(camera-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(player-hook-test EXCLUDE_FROM_ALL ../tests/test_player_hook.cpp)
+target_compile_options(player-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(ledge-hook-test EXCLUDE_FROM_ALL ../tests/test_ledge_hook.cpp)
+target_compile_options(ledge-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(switch-hook-test EXCLUDE_FROM_ALL ../tests/test_switch_hook.cpp)
+target_compile_options(switch-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -mno-red-zone)
+add_executable(menu-hook-test EXCLUDE_FROM_ALL ../tests/test_menu_hook.cpp)
+target_compile_options(menu-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(graphics-hook-test EXCLUDE_FROM_ALL ../tests/test_graphics_hook.cpp)
+target_compile_options(graphics-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(readback-sources-test EXCLUDE_FROM_ALL ../tests/test_readback_sources.cpp)
+target_include_directories(readback-sources-test PRIVATE shadps4)
+target_compile_options(readback-sources-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(page-state-test EXCLUDE_FROM_ALL ../tests/test_page_state.cpp)
+target_include_directories(page-state-test PRIVATE ../tests/stubs shim shadps4)
+target_link_libraries(page-state-test PRIVATE Boost::headers)
+target_compile_options(page-state-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
+    shadps4/video_core/renderer_vulkan/fsr_driver.cpp
+    shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
+target_include_directories(fsr4-bench PRIVATE shim shadps4 shadps4/video_core/renderer_vulkan/fsr411)
+target_compile_definitions(fsr4-bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan
+    fmt::fmt Boost::headers tsl::robin_map Threads::Threads)
+
+add_executable(cheat-hook-test ../tests/test_cheat_hook.cpp)
+target_compile_options(cheat-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+add_executable(swapchain-focus-test EXCLUDE_FROM_ALL ../tests/test_swapchain_focus.cpp
+    shim/window.cpp shim/spartanport_settings.cpp)
+target_include_directories(swapchain-focus-test PRIVATE shim shadps4)
+target_link_libraries(swapchain-focus-test PRIVATE PkgConfig::SDL3 Vulkan::Vulkan fmt::fmt)
+target_compile_options(swapchain-focus-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+add_executable(frame-pacing-test EXCLUDE_FROM_ALL ../tests/test_frame_pacing.cpp)
+target_include_directories(frame-pacing-test PRIVATE shim)
+target_compile_options(frame-pacing-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+if (WIN32)
+    target_sources(frame-pacing-test PRIVATE ../src/compat_win.c)
+    target_link_libraries(frame-pacing-test PRIVATE onecore bcrypt)
+endif()
+
+add_executable(reg-dirty-test EXCLUDE_FROM_ALL ../tests/test_reg_dirty.cpp)
+target_compile_options(reg-dirty-test PRIVATE -UNDEBUG)
+target_include_directories(reg-dirty-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(reg-dirty-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
